@@ -1,0 +1,27 @@
+# SkillHub 上架清单
+name: tiktok-eu-pricing
+slug: tiktok-eu-pricing
+display_name: TikTok 欧盟定价速算（免费版）
+version: 1.3.8
+author: 秋庭AI笔记
+author_email: admin@geovantage.net
+category: ecommerce
+tags:
+  - TikTok
+  - 欧盟
+  - 定价
+  - 跨境电商
+  - VAT
+trigger_keywords:
+  - 欧盟定价
+  - 欧洲算价
+  - 德国卖多少钱
+  - 法国定价
+  - 欧盟站点怎么定价
+  - EU pricing
+description:
+  zh: 说一句「这个品在德国卖多少钱」，直接给出含 VAT 的应定价和费用拆解（佣金/VAT/支付手续费/智能推广/关税/运费）。覆盖欧盟全境，每天每 IP 免费 15 次，不用注册。实际扣费以你的结算单为准，发截图可校准。
+quick_prompts:
+  - 这个品在德国卖多少钱？成本 40 元、600 克、居家类
+  - 法国卖多少钱？成本 25 元、300 克
+  - 西班牙这个价能赚多少？成本 30 元、500 克、售价 39.9 欧
