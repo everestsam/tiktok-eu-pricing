@@ -1,0 +1,142 @@
+"""TikTok 欧盟定价速算 · 客户端（薄壳，不含任何费率与算法）
+
+用法：
+  python quote.py --country 德国 --cost 40 --weight 600 --category "Home Supplies" --margin 0.25
+  python quote.py --country 法国 --cost 40 --weight 600 --category "Kitchenware" --price 33.25
+  python quote.py --country 德国 --cost 40 --weight 300 --dims 40x30x30
+  python quote.py --country 德国 --cost 0.23 --weight 1 --qty 3 --unit-net 20 --pack-rule "1-2:10,3-5:20"
+  python quote.py --submit-sample sample.json
+"""
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = os.environ.get("EU_PRICING_API", "https://api.geovantage.net")
+_SECRET = base64.b64decode("Y2E5YmNjZmY4Zjk3MWM3Njc1NmMwODA3ZWJlNmMwODllYjFmMzExZTFlNzNiNDc5").decode()
+
+
+def _canon(body: dict) -> str:
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sign(body: dict) -> dict:
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(8)
+    sig = hmac.new(_SECRET.encode(),
+                   f"{_canon(body)}|{ts}|{nonce}".encode(),
+                   hashlib.sha256).hexdigest()[:16]
+    return {"Content-Type": "application/json", "X-EU-TS": ts,
+            "X-EU-NONCE": nonce, "X-EU-SIGN": sig}
+
+
+def quote(body: dict) -> dict:
+    req = urllib.request.Request(API + "/quote", data=_canon(body).encode(),
+                                 headers=_sign(body), method="POST")
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode())
+
+
+def submit_sample(path: str) -> dict:
+    data = json.loads(open(path, encoding="utf-8").read())
+    req = urllib.request.Request(API + "/eu/sample",
+                                 data=json.dumps(data, ensure_ascii=False).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--country", help="目的国，如 德国/法国/意大利/DE/FR")
+    ap.add_argument("--cost", type=float, help="成本价 CNY")
+    ap.add_argument("--weight", type=int, help="重量 g")
+    ap.add_argument("--category", default="Home Supplies", help="类目")
+    ap.add_argument("--margin", type=float, default=0.25, help="目标利润率（占售价），默认 0.25")
+    ap.add_argument("--price", type=float, help="给定售价（验算模式）")
+    ap.add_argument("--shipping", default="1", help="1=包邮（默认），0=买家付运费")
+    ap.add_argument("--promo", type=float, help="Smart Promotion 费率，默认 2%%")
+    ap.add_argument("--new-seller", action="store_true", help="新卖家优惠费率")
+    ap.add_argument("--cargo", default="普货", help="货物类型：普货/特货/敏货")
+    ap.add_argument("--dims", help="包装尺寸 长x宽x高（cm），如 40x30x30；按体积重计（cm³÷8000）")
+    ap.add_argument("--qty", type=int, default=1, help="件数（配合 --unit-net 自动折算包裹重量）")
+    ap.add_argument("--unit-net", type=float, help="单件净重(g)；给了就按 件数×净重+包装 折算")
+    ap.add_argument("--pack", type=float, help="包装重量(g)，固定值")
+    ap.add_argument("--pack-rule", help="分段包装规则，如 '1-2:10,3+:20'")
+    ap.add_argument("--origin", default="DE", help="保留参数（直邮价卡不分发货国）")
+    ap.add_argument("--submit-sample", metavar="JSON", help="回传结算单样本的 JSON 文件")
+    a = ap.parse_args()
+
+    try:
+        if a.submit_sample:
+            r = submit_sample(a.submit_sample)
+            print(f"已回传：{r.get('id')}")
+            for k, v in (r.get("derived") or {}).items():
+                print(f"  {k}: {v*100:.2f}%")
+            return
+
+        if not (a.country and a.cost and a.weight):
+            sys.exit("缺参数：--country --cost --weight（用 --help 看用法）")
+
+        body = {"country": a.country, "cost": float(a.cost), "weight": int(a.weight),
+                "category": a.category, "margin": float(a.margin),
+                "shipping": a.shipping, "origin": a.origin, "cargo": a.cargo}
+        if a.promo is not None:
+            body["promo"] = float(a.promo)
+        if a.price:
+            body["price"] = float(a.price)
+        if a.new_seller:
+            body["new_seller"] = "1"
+        if a.dims:
+            body["dims"] = a.dims
+        if a.qty and a.qty > 1:
+            body["qty"] = int(a.qty)
+        if a.unit_net:
+            body["qty"] = int(a.qty or 1)
+            body["unit_net"] = float(a.unit_net)
+        if a.pack is not None:
+            body["pack"] = float(a.pack)
+        if a.pack_rule:
+            body["pack_rule"] = a.pack_rule
+        r = quote(body)
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode())
+        except Exception:
+            err = {"error": str(e)}
+        if e.code == 429:
+            print(f"{err.get('error')}")
+            print("明天 0 点重置。要不限次、多国对比、批量算 → 用完整版。")
+        else:
+            print(f"算价失败：{err.get('error')}")
+        sys.exit(1)
+    except Exception as e:
+        sys.exit(f"连不上算价服务：{e}")
+
+    q = r.get("quota") or {}
+    print(f"【{r['country']} · {r['category']}】应定价 €{r['price']:.2f}（约 {r['price_cny']:.0f} 元）")
+    for b in r.get("breakdown", []):
+        print(f"  {b['name']:<12}{b['amount']:>8.2f}  {b['pct']:>5.1f}%")
+    print(f"  {'你的利润':<12}{r['profit_cny']:>8.1f} 元（{r['margin_actual']*100:.1f}%）")
+    notes = []
+    if r.get("commission_note"):
+        notes.append(f"佣金 {r['commission_rate']*100:.0f}%（{r['commission_note']}）")
+    notes.append(f"VAT {r['vat_rate']*100:.0f}%")
+    if r.get("freight_note"):
+        notes.append(r["freight_note"])
+    if r.get("weight_used"):
+        notes.insert(0, f"计费重量 {r['weight_used']}g" + ("（未计包装）" if r.get("pack_missing") else ""))
+    print("  " + " | ".join(notes))
+    if q:
+        print(f"  今日额度：{q.get('used')}/{q.get('limit')}（剩余 {q.get('remaining')} 次）")
+
+
+if __name__ == "__main__":
+    main()
