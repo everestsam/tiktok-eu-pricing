@@ -4,7 +4,6 @@
   python quote.py --country 德国 --cost 40 --weight 600 --category "Home Supplies" --margin 0.25
   python quote.py --country 法国 --cost 40 --weight 600 --category "Kitchenware" --price 33.25
   python quote.py --country 德国 --cost 40 --weight 300 --dims 40x30x30
-  python quote.py --country 德国 --cost 0.23 --weight 1 --qty 3 --unit-net 20 --pack-rule "1-2:10,3-5:20"
   python quote.py --submit-sample sample.json
 """
 import argparse
@@ -13,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -37,11 +37,22 @@ def _sign(body: dict) -> dict:
             "X-EU-NONCE": nonce, "X-EU-SIGN": sig}
 
 
-def quote(body: dict) -> dict:
-    req = urllib.request.Request(API + "/quote", data=_canon(body).encode(),
-                                 headers=_sign(body), method="POST")
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode())
+def quote(body: dict, _retry: int = 1) -> dict:
+    """带一次自动重试：网络抖动/临时 5xx 时重试，429 不重试（额度已扣）"""
+    for attempt in range(_retry + 1):
+        try:
+            req = urllib.request.Request(API + "/quote", data=_canon(body).encode(),
+                                         headers=_sign(body), method="POST")
+            with urllib.request.urlopen(req, timeout=25) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or attempt >= _retry:
+                raise
+        except Exception:
+            if attempt >= _retry:
+                raise
+            time.sleep(1.5)
+    raise RuntimeError("unreachable")
 
 
 def submit_sample(path: str) -> dict:
@@ -61,7 +72,7 @@ def main():
     ap.add_argument("--category", default="Home Supplies", help="类目")
     ap.add_argument("--margin", type=float, default=0.25, help="目标利润率（占售价），默认 0.25")
     ap.add_argument("--price", type=float, help="给定售价（验算模式）")
-    ap.add_argument("--shipping", default="1", help="1=包邮（默认），0=买家付运费")
+    ap.add_argument("--shipping", default="1", help="1=包邮（默认），0=买方付运费")
     ap.add_argument("--promo", type=float, help="Smart Promotion 费率，默认 2%%")
     ap.add_argument("--new-seller", action="store_true", help="新卖家优惠费率")
     ap.add_argument("--cargo", default="普货", help="货物类型：普货/特货/敏货")
@@ -84,6 +95,16 @@ def main():
 
         if not (a.country and a.cost and a.weight):
             sys.exit("缺参数：--country --cost --weight（用 --help 看用法）")
+        if a.cost <= 0 or a.weight <= 0:
+            sys.exit("成本和重量必须大于 0（单位：元 / 克）")
+        if a.qty < 1:
+            sys.exit("件数必须 ≥ 1")
+        if a.dims:
+            parts = a.dims.replace("x", "*").replace("×", "*").split("*")
+            if len(parts) != 3 or not all(p.replace(".", "", 1).isdigit() for p in parts):
+                sys.exit(f"尺寸格式不对：「{a.dims}」。要三个数，用 x 连接，例如 40x30x30（单位 cm）")
+        if a.pack_rule and not re.match(r"^\s*\d+(\s*-\s*\d+|\+)?\s*:\s*\d+(\.\d+)?\s*(,\s*\d+(\s*-\s*\d+|\+)?\s*:\s*\d+(\.\d+)?\s*)*$", a.pack_rule):
+            sys.exit(f"包装规则格式不对：「{a.pack_rule}」。写法如 1-2:10,3-5:20,6+:30（件数范围:包装克数）")
 
         body = {"country": a.country, "cost": float(a.cost), "weight": int(a.weight),
                 "category": a.category, "margin": float(a.margin),
