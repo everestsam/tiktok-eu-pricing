@@ -7,7 +7,6 @@
   python quote.py --submit-sample sample.json
 """
 import argparse
-import base64
 import hashlib
 import hmac
 import json
@@ -20,21 +19,62 @@ import urllib.error
 import urllib.request
 
 API = os.environ.get("EU_PRICING_API", "https://api.geovantage.net")
-_SECRET = base64.b64decode("Y2E5YmNjZmY4Zjk3MWM3Njc1NmMwODA3ZWJlNmMwODllYjFmMzExZTFlNzNiNDc5").decode()
+# 本机凭据文件：只存「本机专属密钥」，不存任何全局密钥。
+# 包里不携带任何密钥 —— 首次运行向服务端登记本机，换回一把仅属于本机的密钥。
+_CONF = os.environ.get("EU_PRICING_CONF") or os.path.join(
+    os.path.expanduser("~"), ".tiktok-eu-pricing.json")
 
 
 def _canon(body: dict) -> str:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _load_conf() -> dict:
+    try:
+        with open(_CONF, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_conf(d: dict) -> None:
+    try:
+        with open(_CONF, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def _install() -> tuple:
+    """返回 (install_id, secret)。没登记过就去服务端登记，结果缓存在本机。"""
+    c = _load_conf()
+    if c.get("install_id") and c.get("secret"):
+        return c["install_id"], c["secret"]
+    iid = c.get("install_id") or ("eu-" + secrets.token_hex(12))
+    req = urllib.request.Request(
+        API + "/eu/handshake",
+        data=json.dumps({"install_id": iid}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        d = json.loads(r.read().decode())
+    c = {"install_id": d["install_id"], "secret": d["secret"]}
+    _save_conf(c)
+    return c["install_id"], c["secret"]
+
+
 def _sign(body: dict) -> dict:
+    """用本机密钥签名。登记失败时退回无签名（服务端会给取整价，不报错）。"""
+    try:
+        iid, sec = _install()
+    except Exception:
+        return {"Content-Type": "application/json"}
     ts = str(int(time.time()))
     nonce = secrets.token_hex(8)
-    sig = hmac.new(_SECRET.encode(),
+    sig = hmac.new(sec.encode(),
                    f"{_canon(body)}|{ts}|{nonce}".encode(),
                    hashlib.sha256).hexdigest()[:16]
     return {"Content-Type": "application/json", "X-EU-TS": ts,
-            "X-EU-NONCE": nonce, "X-EU-SIGN": sig}
+            "X-EU-NONCE": nonce, "X-EU-SIGN": sig, "X-EU-INSTALL": iid}
 
 
 def quote(body: dict, _retry: int = 1) -> dict:
@@ -57,11 +97,22 @@ def quote(body: dict, _retry: int = 1) -> dict:
 
 def submit_sample(path: str) -> dict:
     data = json.loads(open(path, encoding="utf-8").read())
-    req = urllib.request.Request(API + "/eu/sample",
-                                 data=json.dumps(data, ensure_ascii=False).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode())
+    _retry = 1
+    for attempt in range(_retry + 1):
+        try:
+            req = urllib.request.Request(API + "/eu/sample",
+                                         data=json.dumps(data, ensure_ascii=False).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=25) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or attempt >= _retry:
+                raise
+        except Exception:
+            if attempt >= _retry:
+                raise
+            time.sleep(1.5)
+    raise RuntimeError("unreachable")
 
 
 def main():
@@ -72,7 +123,7 @@ def main():
     ap.add_argument("--category", default="Home Supplies", help="类目")
     ap.add_argument("--margin", type=float, default=0.25, help="目标利润率（占售价），默认 0.25")
     ap.add_argument("--price", type=float, help="给定售价（验算模式）")
-    ap.add_argument("--shipping", default="1", help="1=包邮（默认），0=买方付运费")
+    ap.add_argument("--shipping", default="1", help="1=包邮（默认），0=买家付运费")
     ap.add_argument("--promo", type=float, help="Smart Promotion 费率，默认 2%%")
     ap.add_argument("--new-seller", action="store_true", help="新卖家优惠费率")
     ap.add_argument("--cargo", default="普货", help="货物类型：普货/特货/敏货")
@@ -82,13 +133,13 @@ def main():
     ap.add_argument("--pack", type=float, help="包装重量(g)，固定值")
     ap.add_argument("--pack-rule", help="分段包装规则，如 '1-2:10,3+:20'")
     ap.add_argument("--origin", default="DE", help="保留参数（直邮价卡不分发货国）")
-    ap.add_argument("--submit-sample", metavar="JSON", help="回传结算单样本的 JSON 文件")
+    ap.add_argument("--submit-sample", metavar="JSON", help="提交客户已同意的结算单费用明细（需先征得客户同意）")
     a = ap.parse_args()
 
     try:
         if a.submit_sample:
             r = submit_sample(a.submit_sample)
-            print(f"已回传：{r.get('id')}")
+            print(f"已提交，样本编号 {r.get('id')}（已用于核对费率口径）")
             for k, v in (r.get("derived") or {}).items():
                 print(f"  {k}: {v*100:.2f}%")
             return
@@ -100,7 +151,7 @@ def main():
         if a.qty < 1:
             sys.exit("件数必须 ≥ 1")
         if a.dims:
-            parts = a.dims.replace("x", "*").replace("×", "*").split("*")
+            parts = a.dims.replace("x", "*").replace("X", "*").replace("×", "*").split("*")
             if len(parts) != 3 or not all(p.replace(".", "", 1).isdigit() for p in parts):
                 sys.exit(f"尺寸格式不对：「{a.dims}」。要三个数，用 x 连接，例如 40x30x30（单位 cm）")
         if a.pack_rule and not re.match(r"^\s*\d+(\s*-\s*\d+|\+)?\s*:\s*\d+(\.\d+)?\s*(,\s*\d+(\s*-\s*\d+|\+)?\s*:\s*\d+(\.\d+)?\s*)*$", a.pack_rule):
